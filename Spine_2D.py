@@ -66,11 +66,11 @@ LANG = None  # "ja" または "en"
 
 def choose_language() -> str:
     print("Select language / 言語を選択してください:")
-    print("  1: Japanese")
+    print("  1: 日本語")
     print("  2: English")
     while True:
         choice = input("番号を入力 / Enter number [1/2]: ").strip()
-        if choice in ("1", "ja", "JA", "Japanese"):
+        if choice in ("1", "ja", "JA", "日本語"):
             return "ja"
         if choice in ("2", "en", "EN", "English"):
             return "en"
@@ -171,6 +171,7 @@ BATCH_SIZE = max(2, int(20 * (1200 / CANVAS_DIM) ** 2))
 MARGIN = 1.15
 MAKE_VIDEO = True
 MAKE_ALPHA_MOV = True
+ALPHA_MOV_SCALE = 0.5    # 透過用movだけ解像度を落として容量を減らす(mp4は解像度そのまま)
 SHOW_BROWSER_LOGS = False
 LOAD_TIMEOUT_MS = 600000
 
@@ -208,7 +209,7 @@ def try_extract_spine_pair(atlas_json_path: Path):
     try:
         with open(atlas_json_path, "r", encoding="utf-8") as f:
             atlas_data = json.load(f)
-        atlas_entry = next((d for d in atlas_data if d.get("Type") == "SpineAtlasAsset"), None)
+        atlas_entry = next((d for d in atlas_data if isinstance(d, dict) and d.get("Type") == "SpineAtlasAsset"), None)
         if atlas_entry is None:
             return None
         atlas_raw = atlas_entry["Properties"]["RawData"]
@@ -219,14 +220,14 @@ def try_extract_spine_pair(atlas_json_path: Path):
             return None
         with open(data_json_path, "r", encoding="utf-8") as f:
             skel_data = json.load(f)
-        skel_entry = next((d for d in skel_data if d.get("Type") == "SpineSkeletonDataAsset"), None)
+        skel_entry = next((d for d in skel_data if isinstance(d, dict) and d.get("Type") == "SpineSkeletonDataAsset"), None)
         if skel_entry is None:
             return None
         skel_raw = skel_entry["Properties"]["RawData"]
         if not isinstance(skel_raw, list):
             return None
         return atlas_raw.replace("\\n", "\n"), bytes(bytearray(skel_raw))
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError, UnicodeDecodeError, OSError):
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError, AttributeError, UnicodeDecodeError, OSError):
         return None
 
 
@@ -234,8 +235,8 @@ def try_extract_spine_json(json_path: Path):
     try:
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        atlas_entry = next((d for d in data if d.get("Type") == "SpineAtlasAsset"), None)
-        skel_entry = next((d for d in data if d.get("Type") == "SpineSkeletonDataAsset"), None)
+        atlas_entry = next((d for d in data if isinstance(d, dict) and d.get("Type") == "SpineAtlasAsset"), None)
+        skel_entry = next((d for d in data if isinstance(d, dict) and d.get("Type") == "SpineSkeletonDataAsset"), None)
         if atlas_entry is None or skel_entry is None:
             return None
         atlas_raw = atlas_entry["Properties"]["rawData"]
@@ -243,7 +244,7 @@ def try_extract_spine_json(json_path: Path):
         if not isinstance(atlas_raw, str) or not isinstance(skel_raw, list):
             return None
         return atlas_raw.replace("\\n", "\n"), bytes(bytearray(skel_raw))
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError, UnicodeDecodeError, OSError):
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError, AttributeError, UnicodeDecodeError, OSError):
         return None
 
 
@@ -514,6 +515,10 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # デフォルトのrequest_queue_size(5)だと、ページ数の多いatlas(10枚以上)を
+    # 複数ワーカーが同時に読み込もうとした時に接続待ち行列が溢れて
+    # ERR_CONNECTION_REFUSED になることがあったため、大きめに増やしておく。
+    request_queue_size = 128
 
 
 def serve_output_root(port: int):
@@ -578,6 +583,7 @@ def encode_outputs(rgba_pattern: str, out_dir: Path, name: str, canvas_dim: int)
         r2 = subprocess.run([
             FFMPEG_BIN, "-y", "-framerate", str(FPS),
             "-i", rgba_pattern,
+            "-vf", f"scale=iw*{ALPHA_MOV_SCALE}:ih*{ALPHA_MOV_SCALE}",
             "-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
             str(mov_path)
         ], check=False, capture_output=True)
@@ -638,6 +644,19 @@ def render_character(page, char_dir_name, skel_name, atlas_name):
         duration = page.evaluate("(a) => window.getAnimDuration(a)", anim)
         if not duration or duration <= 0:
             continue
+
+        # 途中で中断して再実行した場合、既にこのアニメーションのmp4(・mov)が
+        # 出来上がっていればレンダリングをスキップする(キャラ単位の完了マーカーとは別に、
+        # アニメーション単位でも再開できるようにするため)。
+        existing_mp4 = out_dir / f"{anim}.mp4"
+        existing_mov = out_dir / f"{anim}_alpha.mov"
+        mp4_already_ok = existing_mp4.exists() and existing_mp4.stat().st_size > 1024
+        mov_already_ok = (not MAKE_ALPHA_MOV) or (existing_mov.exists() and existing_mov.stat().st_size > 1024)
+        if mp4_already_ok and mov_already_ok:
+            print(t(f"    [スキップ] {char_dir_name} / {anim} : 既に書き出し済み",
+                     f"    [Skipped] {char_dir_name} / {anim} : already rendered"))
+            continue
+
         page.evaluate("([a, s]) => window.fitCameraToAnim(a, s)", [anim, 20])
         n_frames = max(1, int(duration * FPS))
         frame_dir = out_dir / "frames" / anim
